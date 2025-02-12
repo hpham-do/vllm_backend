@@ -42,6 +42,10 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
 
 from utils.metrics import VllmStatLogger
+import pynvml
+import redis
+import time
+import socket
 
 _VLLM_ENGINE_ARGS_FILENAME = "model.json"
 _MULTI_LORA_ARGS_FILENAME = "multi_lora.json"
@@ -102,6 +106,21 @@ class TritonPythonModel:
 
         return auto_complete_model_config
 
+    # scan for all idles gpus
+    def get_idle_gpus(self, threshold):
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+        idle_gpus = []
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            mem_usage = mem_info.used / mem_info.total * 100
+            if mem_usage < threshold:
+                idle_gpus.append(str(i))
+        pynvml.nvmlShutdown()
+        return idle_gpus
+
+
     def initialize(self, args):
         self.args = args
         self.logger = pb_utils.Logger
@@ -160,7 +179,46 @@ class TritonPythonModel:
         aync_engine_args = AsyncEngineArgs(**self.vllm_engine_config)
         self.llm_engine = AsyncLLMEngine.from_engine_args(aync_engine_args)
 
+        # Get triton server address
+        hostname = socket.gethostname()
+        tritonserver = socket.gethostbyname(hostname)
+        idle_gpus = self.get_idle_gpus(30)
+        proccessed_ts = int(time.time())
+
+        # Report the current GPUs to Redis
+        redis_gpu_report = \
+        "availabe_gpu:" + ",".join(idle_gpus) + \
+        " availabe_gpu_count:" + str(len(idle_gpus)) + \
+        " created_at:" + str(proccessed_ts)
+        
+        # Get the difference between self.device_ids and idle_gpus
+        gpu_occupied = set(self.device_ids) - set(idle_gpus)
+
+        model_name = self.args["model_name"]
+
+        redis_model_report = \
+        "version:" + self.args["model_version"] + \
+        " tritonserver:" + tritonserver + \
+        " loaded_gpuid:" + ",".join(gpu_occupied) + \
+        " created_at:" + str(proccessed_ts)
+
+        REDIS_USERNAME = os.getenv("REDIS_USERNAME", "default")
+        REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+        REDIS_ADDRESS = os.getenv("REDIS_ADDRESS", "private-genai-redis-do-user-17607903-0.i.db.ondigitalocean.com")
+        REDIS_PORT = os.getenv("REDIS_PORT", 25061)
+        pool = redis.ConnectionPool().from_url(f"rediss://{REDIS_USERNAME}:{REDIS_PASSWORD}@{REDIS_ADDRESS}:{REDIS_PORT}")
+        r = redis.Redis().from_pool(pool)
+
+        self.logger.log_info(f"Report to Redis: {redis_gpu_report} ")
+        r.set(f'triton_server:{tritonserver}', redis_gpu_report)
+        r.set(f'model:{model_name}', redis_model_report)
+
+        # Read from Redis to verify the report
+        self.logger.log_info(f"Read from Redis: {r.get(f'triton_server:{tritonserver}')}")
+        self.logger.log_info(f"Read from Redis: {r.get(f'model:{model_name}')}")
+
         # Create vLLM custom metrics
+        self.vllm_metrics = None
         if (
             "REPORT_CUSTOM_METRICS" in self.model_config["parameters"]
             and self.model_config["parameters"]["REPORT_CUSTOM_METRICS"]["string_value"]
@@ -174,22 +232,27 @@ class TritonPythonModel:
                 }
                 # Add vLLM custom metrics
                 engine_config = self.llm_engine.engine.model_config
-                self.llm_engine.add_logger(
-                    "triton", VllmStatLogger(labels, engine_config.max_model_len)
+                self.vllm_metrics = VllmStatLogger(
+                    labels, engine_config.max_model_len, self.logger
                 )
+                self.llm_engine.add_logger("triton", self.vllm_metrics)
             except pb_utils.TritonModelException as e:
                 if "metrics not supported" in str(e):
                     # Metrics are disabled at the server
                     self.logger.log_info("[vllm] Metrics not supported")
                 else:
                     raise e
+            
+
 
     def setup_lora(self):
         self.enable_lora = False
+        # Check if `enable_lora` field is in the `model.json`,
+        # and if it is, read its contents, which can be string or bool.
 
         if (
             "enable_lora" in self.vllm_engine_config.keys()
-            and self.vllm_engine_config["enable_lora"].lower() == "true"
+            and str(self.vllm_engine_config["enable_lora"]).lower() == "true"
         ):
             # create Triton LoRA weights repository
             multi_lora_args_filepath = os.path.join(
@@ -232,6 +295,10 @@ class TritonPythonModel:
             )
             # vLLM doesn't currently (v0.4.2) expose device selection in the APIs
             torch.cuda.set_device(triton_device_id)
+        
+
+        self.device_ids = self.get_idle_gpus(30)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(self.device_ids)
 
     def create_task(self, coro):
         """
@@ -300,6 +367,7 @@ class TritonPythonModel:
                 params_dict[k] = float(params_dict[k])
 
         int_keys = ["best_of", "max_tokens", "min_tokens", "n", "top_k"]
+        self.max_tokens = params_dict.get("max_tokens", 5000)
         for k in int_keys:
             if k in params_dict:
                 params_dict[k] = int(params_dict[k])
@@ -357,6 +425,7 @@ class TritonPythonModel:
                 vllm_output.outputs, previous_outputs_lengths
             )
         ]
+        
         triton_output_tensor = pb_utils.Tensor(
             "text_output", np.asarray(text_outputs, dtype=self.output_dtype)
         )
@@ -431,7 +500,7 @@ class TritonPythonModel:
             response_iterator = await self.llm_engine.add_request(
                 request_id, prompt, sampling_params, lora_request=lora_request
             )
-
+            dist_until_max = self.max_tokens
             async for output in response_iterator:
                 is_cancelled = response_state["is_cancelled"]
                 if not stream:
@@ -461,13 +530,28 @@ class TritonPythonModel:
                             len(prev_output.text)
                             for prev_output in prev_outputs.outputs
                         ]
+                        dist_until_max = self.max_tokens - len(prev_outputs.outputs[-1].token_ids)
+
+                    if  (dist_until_max < 30 and prev_outputs.outputs[-1].text[-1] in [".","!","?","\n"]):
+                        response_state["last_response_generated"] = True
+                        flags = pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
+                        decrement_ongoing_request_count = False
+                        output.finished = True
+                        self._response_queue.put_nowait((response_state, response, flags))
+                        break
+
                     response = self.create_stream_response(output, prev_outputs_lengths)
+
                     flags = 0
                     if output.finished:
                         response_state["last_response_generated"] = True
                         flags = pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
                         decrement_ongoing_request_count = False
+
+
                     self._response_queue.put_nowait((response_state, response, flags))
+
+
                 prev_outputs = output
 
             last_output = output
@@ -571,6 +655,10 @@ class TritonPythonModel:
         if self._response_thread is not None:
             self._response_thread.join()
             self._response_thread = None
+
+        # Shutdown the logger thread.
+        if self.vllm_metrics is not None:
+            self.vllm_metrics.finalize()
 
         # When using parallel tensors, the stub process may not shutdown due to
         # unreleased references, so manually run the garbage collector once.
